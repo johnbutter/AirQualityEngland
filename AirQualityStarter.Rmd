@@ -1,0 +1,323 @@
+---
+title: "R Prediction Starter"
+author: "John Young"
+date: "March 13, 2017"
+output:
+  html_document: default
+  html_notebook: default
+---
+```{r message=FALSE, echo=FALSE}
+suppressMessages(library(data.table))
+suppressMessages(library(Matrix))
+suppressMessages(library(mlr))
+suppressMessages(library(readr))
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(corrplot))
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(Rtsne))
+suppressMessages(library(e1071))
+suppressMessages(library(stringi))
+suppressMessages(require(xgboost))
+suppressMessages(require(dplyr))
+suppressMessages(require(lubridate))
+```
+
+##Let's open the files and EDA
+Read with `readr` package which is fast.
+
+```{r message=FALSE, echo=FALSE}
+train.raw <- read_csv('~/Desktop/Data/Kaggle/AirQuality/train.csv')
+test.raw <- read_csv('~/Desktop/Data/Kaggle/AirQuality/test.csv')
+
+keep.target<-train.raw$mortality_rate
+train.raw$mortality_rate<-NULL
+
+train.raw$PM25<-as.numeric(train.raw$PM25)
+train.raw$NO2<-as.numeric(train.raw$NO2)
+
+# Build full set first combining both train and test
+feature.full<-rbind(train.raw, test.raw)
+```
+
+Let's take a quick peak at the data from train and test.
+```{r echo=FALSE}
+# Structure
+head(train.raw)
+head(test.raw)
+```
+
+There are a number of things we can do to prep and clean up the data for an initial prediction of mortality-rate.  
+
+  - Region might be able to be broken down further.
+  - Date can be broken into month day year 
+  - Missing values in train (may need to impute)
+  - log transformations of a few variables and the target
+  - new features mean and medians by region, month, day, year 
+  
+```{r echo=FALSE}
+# Fix NA in PM25,NO2,etc
+feature.full[c("PM25")][is.na(feature.full[c("PM25")])] <- as.numeric(round(median(test.raw$PM25,na.rm=T),3))
+feature.full[c("NO2")][is.na(feature.full[c("NO2")])] <- as.numeric(round(median(test.raw$NO2,na.rm=T),3))
+feature.full[c("PM10")][is.na(feature.full[c("PM10")])] <- as.numeric(round(median(test.raw$PM10,na.rm=T),3))
+feature.full[c("O3")][is.na(feature.full[c("O3")])] <- as.numeric(round(median(test.raw$O3,na.rm=T),3))
+
+feature.full$PM25<-as.numeric(feature.full$PM25)
+feature.full$NO2<-as.numeric(feature.full$NO2)
+feature.full$PM10<-as.numeric(feature.full$PM10)
+feature.full$O3<-as.numeric(feature.full$O3)
+
+# transform PM10 and T2M
+feature.full$PM10<-log(feature.full$PM10)
+feature.full$T2M<-log(feature.full$T2M)
+
+# Subset region
+feature.full$region <- as.factor(stri_sub(feature.full$region, -1,-1))
+
+# Split date field
+rm(t_df)
+t_df <- data.frame (year = as.numeric(format(feature.full$date, format = "%Y")),
+                    month = as.numeric(format(feature.full$date, format = "%m")),
+                    day = as.numeric(format(feature.full$date, format = "%d")))
+feature.full<-cbind(feature.full,t_df)
+rm(t_df)
+
+# Create summary table for mortality_rate by region, month, day
+TableFeature<-cbind(feature.full[1:nrow(train.raw),],target = keep.target)
+TableFeature<-as.data.table(TableFeature)
+setkey(TableFeature,region,month,day)
+feature_region_summary<-TableFeature[,list(
+                      RM_med=median(target, na.rm=T),
+                      RM_mean=mean(target, na.rm=T)),
+                by=.(region, month,day)
+                ]
+feature_region_summary<-as.data.table(feature_region_summary)
+rm(TableFeature)
+
+# Add summary features to feature set
+setkeyv(feature_region_summary, c( "month","day"))
+feature.full <- merge(feature.full, feature_region_summary, by.x = c("month", "day", "region"), by.y= c("month", "day", "region"), all.x = TRUE)
+feature.full<-as.data.table(feature.full)
+setkeyv(feature.full, c("Id"))
+feature.full<-as.data.frame(feature.full)
+
+par(mfrow=c(2,4))
+with(feature.full, hist(log(PM10)))
+with(feature.full, hist(O3))
+with(feature.full, hist(log(PM25)))
+with(feature.full, hist(log(NO2)))
+with(feature.full, hist(log(T2M)))
+boxplot(keep.target)
+hist(keep.target)
+par(mfrow=c(1,1))
+
+# Remove unwanted variables
+feature.full$date<-NULL
+feature.full$year<-NULL
+feature.full$month<-NULL
+feature.full$day<-NULL
+feature.full$region<-NULL
+```
+
+Let's look at the new full feature set of data.
+
+```{r message=FALSE, echo=FALSE}
+head(feature.full)
+tail(feature.full)
+```
+
+We can also see the correlation matrix with significance showing PM10 and PM25.
+
+```{r message=FALSE, echo=FALSE}
+# Correlations on train.raw
+# significance test for correlations
+cor.mtest <- function(mat, ...) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat<- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], ...)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+        }
+    }
+  colnames(p.mat) <- rownames(p.mat) <- colnames(mat)
+  p.mat
+}
+
+# Get all correlations
+M<-cor(feature.full[2:8])
+
+# Obtain significance on remaining high correlations
+p.mat <- cor.mtest(M)
+
+# Visualize
+corrplot(M, type="upper", order="hclust", col=brewer.pal(n=8, name="RdBu"),
+         p.mat = p.mat, sig.level = 0.01, insig = "blank")
+```
+
+
+```{r, message=FALSE, echo=FALSE}
+# split train and test with new features for CV tuning
+train.full<-as.data.frame(feature.full[1:nrow(train.raw),])
+test.full<-as.data.frame(feature.full[(nrow(train.raw)+1):nrow(feature.full),])
+
+# Retain target and t_id and balance files for appending
+keep.id<-test.full$Id
+test.full$Id<-NULL
+train.full$Id<-NULL
+train.full<-cbind(train.full, target=keep.target)
+```
+
+
+###Prepare the data
+Before proceeding the data frame will be stored as a *sparse matrix*. The MORTALITY_RATE column will be treated as a target variable and therefore removed from the matrix:
+
+Data will be stored using `DGMatrix` class, which is a recommended way
+```{r, message=FALSE, echo= FALSE}
+require(Matrix)
+train.full.sparse <- sparse.model.matrix(target ~. , data=train.full)
+rm(dtrain)
+dtrain <- xgb.DMatrix(
+  data=train.full.sparse, 
+  label=keep.target,
+  missing = NaN)
+```
+
+#Training and Tuning
+Training is done using 5-fold CV, which is a common place to begin with cross validation. If your TEST set is a % of your TRAINING, you may want to consider replicating that split with your TRAINING only.  That way you have the actual results when you predict on TEST and can see where your algorithms are underperforming or overfitting.  
+
+```{r, message= FALSE}
+
+################# Loop 5x initially to see where the values converge, then 50
+# Automated to run and may take a long time.
+#####################
+nloops<-20 # Set this for the number of random loops
+best_param = list() # You will store your best set of parameters here
+best_seednumber = 1969 # Initialize to same number for starters
+best_error = Inf # Set to infinity for starters
+best_error_index = 0
+best_history<-NULL
+cv.nround = 500 # Set to number of rounds you'd like it to fit - usually higher
+cv.nfold = 5 # 5-Fold Validation
+cv.earlystop = 5 # Stop after consecutive rounds of no improvement
+
+for (iter in 1:nloops) {
+  param <- list(objective = "reg:linear", # Objective for the algorithm
+                #booster="gblinear", # Make sure this aligns to your objective
+                eval_metric="rmse",
+                max_depth = sample(1:20, 1), # Range 8-11 common 8
+                eta = runif(1, .5, .9), # Range .1-.3, common 0.8
+                gamma = runif(1, 0.0, 0.2), # Range 0-.2
+                subsample = runif(1, .6, .9), # Range 0.6-0.9 common 0.7
+                colsample_bytree = runif(1, .5, .8), # Range .5-.8 common 0.7
+                min_child_weight = sample(1:40, 1), # Range 1-40
+                max_delta_step = sample(1:10, 1) # Range 1-10
+  )
+  seed.number = sample.int(10000, 1)[[1]]
+  set.seed(seed.number)
+  history <- xgb.cv(data=dtrain, 
+                 params = param, 
+                 #watchlist = watchlist, 
+                 nfold=cv.nfold, 
+                 nrounds=cv.nround,
+                 verbose = F, # Change to T if you'd like to see it learn
+                 early.stop.round=cv.earlystop, 
+                 #feval=rmpse, # custom evaluation metric function call
+                 maximize=FALSE)
+  huh<-as.data.frame(history$test.rmse.mean)
+  m_error = min(huh) # Make sure you change this if using a different function or err name
+  m_error_index = which(huh==min(huh)) # Sets the number of rounds
+  
+  if (m_error < best_error) {
+    best_error = m_error
+    best_error_index = m_error_index
+    best_seednumber = seed.number
+    best_param = param
+    best_history = history
+  }
+  cat("  Loop:", iter,"  Error:",m_error,"\n"); # Shows which random iteration you are on
+}
+############################################
+# END XGBoost Tuning
+############################################
+```
+```{r, message=FALSE, echo= FALSE}
+nround = best_error_index
+set.seed(best_seednumber)
+cat("Best round:", best_error_index,"\n");
+cat("Best result:",best_error,"\n");
+write.csv(data.frame(best_param), "~/Desktop/Data/Kaggle/AirQuality/XGBPARAM.csv", row.names = F)
+```
+
+## Hyperparameter tuning results
+The results of tuning the parameters is visualized on the following plot:
+
+```{r, message=FALSE, echo= FALSE}
+require(ggplot2)
+
+best_history$trees <- as.integer(rownames(best_history))
+
+ggplot(best_history, aes(x=trees, y=test.rmse.mean)) +
+  geom_line() +
+  geom_errorbar(
+    aes(ymin=test.rmse.mean-test.rmse.std, ymax=test.rmse.mean+test.rmse.std), 
+    width=.05, 
+    color="red") +
+  ggtitle("Tuning ERROR using 5-fold CV") + xlab("Number of rounds") + ylab("ERROR") +
+  annotate("text", 
+           x=max(best_history$trees), 
+           y=max(best_history$test.rmse.mean)-0.1, 
+           label=paste("Best ERROR:\n", min(best_history$test.rmse.mean)), 
+           alpha=.5, 
+           hjust=1) +
+  theme_bw()
+```
+
+## Train XGBoost
+
+```{r, message= FALSE, echo = FALSE}
+rm(dtrain)
+rm(clf)
+```
+```{r, message= FALSE}
+######################################
+# Train XGB Model
+######################################
+train.full.sparse <- sparse.model.matrix(target~., data=train.full)
+dtrain <- xgb.DMatrix(
+  data=train.full.sparse, 
+  label=keep.target,
+  missing = NaN)
+dtest <-data.matrix(test.full, rownames.force = NA)
+
+clf <- xgb.train(   params              = best_param, 
+                    data                = dtrain, 
+                    nrounds             = best_error_index, 
+                    verbose             = F,
+                    maximize            = FALSE
+)
+```
+
+
+## Make predictions and generate a Submission File
+```{r, message= FALSE, echo=TRUE}
+##########################
+# Begin Predictions on Test Data
+##########################
+
+# Make XGB Predictions
+pred.xgb <- rep(0,nrow(test.full))
+pred.xgb <- round(predict(clf, dtest),10)
+# store in frame, may be able to add other models to ensemble later
+airqualitypred <- data.frame(Id=keep.id, mortality_rate=pred.xgb)
+###################################################################
+# Write out submission files
+write.csv(data.frame("Id"=airqualitypred$Id, "mortality_rate"=airqualitypred$mortality_rate), "~/Desktop/Data/Kaggle/AirQuality/baseXGB.csv", row.names = F)
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file).
